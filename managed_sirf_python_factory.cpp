@@ -55,3 +55,14 @@ make_managed_stir_image_handle_from_file(const char* filename)
     }
   CATCH;
 }
+
+extern "C" void*
+make_managed_stir_image_handle_from_existing(void* existing_handle)
+{
+  try
+    {
+      auto& source = objectFromHandle<sirf::STIRImageData>(existing_handle);
+      return newObjectHandle<sirf::ImageData>(make_managed_image_data_from_stir(source));
+    }
+  CATCH;
+}

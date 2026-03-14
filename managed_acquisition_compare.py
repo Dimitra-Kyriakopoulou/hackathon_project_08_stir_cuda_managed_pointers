@@ -17,24 +17,29 @@ raw_pyi = ctypes.CDLL(str(SIRF_OVERLAY / "sirf" / "_pyiutilities.so"), mode=ctyp
 raw_pysirf = ctypes.CDLL(str(SIRF_OVERLAY / "sirf" / "_pysirf.so"), mode=ctypes.RTLD_GLOBAL)
 raw_pystir = ctypes.CDLL(str(SIRF_OVERLAY / "sirf" / "_pystir.so"), mode=ctypes.RTLD_GLOBAL)
 
-import sirf.STIR as STIR
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phantom", required=True, help="Path to the PET phantom .hv file")
-    parser.add_argument("--factory", required=True, help="Path to the managed-image factory shared library")
+    parser.add_argument("--factory", required=True, help="Path to the managed-acquisition factory shared library")
     parser.add_argument("--output", required=True, help="Output directory")
     return parser.parse_args()
 
 
-def make_managed_image(factory_lib: Path, phantom_path: Path):
+def expect_ok(status_handle):
+    if raw_pyi.executionStatus(status_handle) != 0:
+        msg = raw_pyi.executionError(status_handle)
+        text = msg.decode("utf-8", errors="replace") if msg else "unknown engine error"
+        raw_pyi.deleteDataHandle(status_handle)
+        raise RuntimeError(text)
+    raw_pyi.deleteDataHandle(status_handle)
+
+
+def make_managed_acquisition(factory_lib: Path):
     factory = ctypes.CDLL(str(factory_lib), mode=ctypes.RTLD_GLOBAL)
-    factory.make_managed_stir_image_handle_from_file.argtypes = [ctypes.c_char_p]
-    factory.make_managed_stir_image_handle_from_file.restype = ctypes.c_void_p
-    handle = factory.make_managed_stir_image_handle_from_file(str(phantom_path).encode("utf-8"))
+    factory.make_managed_stir_acquisition_handle.restype = ctypes.c_void_p
+    handle = factory.make_managed_stir_acquisition_handle()
     if not handle:
-        raise RuntimeError("factory returned a null managed image handle")
+        raise RuntimeError("factory returned a null managed acquisition handle")
     return handle
 
 
@@ -51,34 +56,25 @@ raw_pysirf.cSIRF_supportsArrayView.argtypes = [ctypes.c_void_p]
 raw_pysirf.cSIRF_supportsArrayView.restype = ctypes.c_void_p
 raw_pystir.cSTIR_parameter.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
 raw_pystir.cSTIR_parameter.restype = ctypes.c_void_p
-raw_pystir.cSTIR_getImageDimensions.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-raw_pystir.cSTIR_getImageDimensions.restype = ctypes.c_void_p
-raw_pystir.cSTIR_getImageData.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-raw_pystir.cSTIR_getImageData.restype = ctypes.c_void_p
+raw_pystir.cSTIR_getAcquisitionDataDimensions.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+raw_pystir.cSTIR_getAcquisitionDataDimensions.restype = ctypes.c_void_p
+raw_pystir.cSTIR_getAcquisitionData.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+raw_pystir.cSTIR_getAcquisitionData.restype = ctypes.c_void_p
 
 
-def expect_ok(status_handle):
-    if raw_pyi.executionStatus(status_handle) != 0:
-        msg = raw_pyi.executionError(status_handle)
-        text = msg.decode("utf-8", errors="replace") if msg else "unknown engine error"
-        raw_pyi.deleteDataHandle(status_handle)
-        raise RuntimeError(text)
-    raw_pyi.deleteDataHandle(status_handle)
-
-
-def get_managed_array(handle):
-    dims = np.zeros(10, dtype=np.int32)
-    expect_ok(raw_pystir.cSTIR_getImageDimensions(handle, dims.ctypes.data))
-    shape = tuple(int(v) for v in dims[:3])
+def get_array(handle):
+    dims = np.zeros(16, dtype=np.int32)
+    expect_ok(raw_pystir.cSTIR_getAcquisitionDataDimensions(handle, dims.ctypes.data))
+    shape = tuple(int(v) for v in dims[:4][::-1])
     data = np.empty(shape, dtype=np.float32)
-    expect_ok(raw_pystir.cSTIR_getImageData(handle, data.ctypes.data))
+    expect_ok(raw_pystir.cSTIR_getAcquisitionData(handle, data.ctypes.data))
     return data
 
 
-def get_managed_flags(handle):
+def get_flags(handle):
     supports_h = raw_pysirf.cSIRF_supportsArrayView(handle)
-    is_managed_h = raw_pystir.cSTIR_parameter(handle, b"ImageData", b"supports_cuda_array_view")
-    cuda_addr_h = raw_pystir.cSTIR_parameter(handle, b"ImageData", b"cuda_address")
+    is_managed_h = raw_pystir.cSTIR_parameter(handle, b"AcquisitionData", b"supports_cuda_array_view")
+    cuda_addr_h = raw_pystir.cSTIR_parameter(handle, b"AcquisitionData", b"cuda_address")
     supports_view = bool(raw_pyi.intDataFromHandle(supports_h))
     is_managed = bool(raw_pyi.intDataFromHandle(is_managed_h))
     cuda_addr = int(raw_pyi.size_tDataFromHandle(cuda_addr_h))
@@ -88,27 +84,29 @@ def get_managed_flags(handle):
     return supports_view, is_managed, cuda_addr
 
 
-def save_panel(phantom_arr, managed_arr, error_arr, output_dir: Path):
-    mid = phantom_arr.shape[0] // 2
-    vmax = float(np.max(phantom_arr))
+def save_panel(expected_arr, managed_arr, error_arr, output_dir: Path):
+    tof = 0
+    sino = expected_arr.shape[1] // 2
+    slice_min = float(np.min(expected_arr[tof, sino]))
+    slice_max = float(np.max(expected_arr[tof, sino]))
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    axes[0].imshow(phantom_arr[mid], cmap="gray", vmin=0.0, vmax=vmax)
-    axes[0].set_title("Reference Phantom")
-    axes[1].imshow(managed_arr[mid], cmap="gray", vmin=0.0, vmax=vmax)
-    axes[1].set_title("Managed-Memory Image")
-    axes[2].imshow(error_arr[mid], cmap="magma")
+    axes[0].imshow(expected_arr[tof, sino], cmap="gray", vmin=slice_min, vmax=slice_max)
+    axes[0].set_title("Expected Ramp")
+    axes[1].imshow(managed_arr[tof, sino], cmap="gray", vmin=slice_min, vmax=slice_max)
+    axes[1].set_title("Managed Acquisition")
+    axes[2].imshow(error_arr[tof, sino], cmap="magma")
     axes[2].set_title("Absolute Error")
     for ax in axes:
         ax.set_xticks([])
         ax.set_yticks([])
     fig.tight_layout()
-    fig.savefig(output_dir / "phantom_managed_error_strip.png", dpi=160, bbox_inches="tight")
+    fig.savefig(output_dir / "acquisition_error_strip.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
 
     for name, arr, cmap, kwargs in (
-        ("phantom.png", phantom_arr[mid], "gray", {"vmin": 0.0, "vmax": vmax}),
-        ("managed_image.png", managed_arr[mid], "gray", {"vmin": 0.0, "vmax": vmax}),
-        ("abs_error.png", error_arr[mid], "magma", {}),
+        ("expected_slice.png", expected_arr[tof, sino], "gray", {"vmin": slice_min, "vmax": slice_max}),
+        ("managed_slice.png", managed_arr[tof, sino], "gray", {"vmin": slice_min, "vmax": slice_max}),
+        ("abs_error_slice.png", error_arr[tof, sino], "magma", {}),
     ):
         plt.figure(figsize=(4, 4))
         plt.imshow(arr, cmap=cmap, **kwargs)
@@ -122,22 +120,20 @@ def main():
     args = parse_args()
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    phantom_path = Path(args.phantom)
-    phantom = STIR.ImageData(str(phantom_path))
-    managed_handle = make_managed_image(Path(args.factory), phantom_path)
+    handle = make_managed_acquisition(Path(args.factory))
 
-    phantom_arr = phantom.as_array()
-    managed_arr = get_managed_array(managed_handle)
-    error_arr = np.abs(phantom_arr - managed_arr)
-    supports_view, is_managed, cuda_addr = get_managed_flags(managed_handle)
+    managed_arr = get_array(handle)
+    expected_arr = np.arange(managed_arr.size, dtype=np.float32).reshape(managed_arr.shape)
+    error_arr = np.abs(expected_arr - managed_arr)
+    supports_view, is_managed, cuda_addr = get_flags(handle)
 
-    rmse = float(np.sqrt(np.mean((phantom_arr - managed_arr) ** 2)))
+    rmse = float(np.sqrt(np.mean((expected_arr - managed_arr) ** 2)))
     mae = float(np.mean(error_arr))
     max_abs_error = float(np.max(error_arr))
-    corr = float(np.corrcoef(phantom_arr.ravel(), managed_arr.ravel())[0, 1])
+    corr = float(np.corrcoef(expected_arr.ravel(), managed_arr.ravel())[0, 1])
 
     metrics = {
-        "shape": list(phantom_arr.shape),
+        "shape": list(managed_arr.shape),
         "rmse": rmse,
         "mae": mae,
         "max_abs_error": max_abs_error,
@@ -145,14 +141,12 @@ def main():
         "supports_array_view": supports_view,
         "supports_cuda_array_view": is_managed,
         "cuda_address": cuda_addr,
-        "mid_slice_index": int(phantom_arr.shape[0] // 2),
+        "tested_slice": {"tof": 0, "sinogram": int(managed_arr.shape[1] // 2)},
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-
-    save_panel(phantom_arr, managed_arr, error_arr, output_dir)
-
+    save_panel(expected_arr, managed_arr, error_arr, output_dir)
     print(json.dumps(metrics, indent=2))
-    raw_pyi.deleteDataHandle(managed_handle)
+    raw_pyi.deleteDataHandle(handle)
 
 
 if __name__ == "__main__":

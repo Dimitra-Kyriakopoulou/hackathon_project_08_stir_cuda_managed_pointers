@@ -2,6 +2,7 @@
 #define __stir_cuda_managed_memory_H__
 /*
     Copyright (C) 2026
+    Prototype helper for Project 8 hackathon work.
 */
 
 #include "stir/common.h"
@@ -11,6 +12,7 @@
 #include "stir/Array.h"
 #include "stir/CartesianCoordinate3D.h"
 #include "stir/IndexRange.h"
+#include "stir/ProjDataInMemory.h"
 #include "stir/VoxelsOnCartesianGrid.h"
 #include "stir/error.h"
 #include "stir/shared_ptr.h"
@@ -43,6 +45,35 @@ make_cuda_managed_array(const IndexRange<num_dimensions>& range)
       range, make_cuda_managed_shared_array<elemT>(range.size_all()));
   std::fill(array.begin_all(), array.end_all(), elemT(0));
   return array;
+}
+
+inline std::size_t
+proj_data_num_elems(const ProjDataInfo& proj_data_info)
+{
+  std::size_t num_3d = 0;
+  for (int segment_num = proj_data_info.get_min_segment_num();
+       segment_num <= proj_data_info.get_max_segment_num();
+       ++segment_num)
+    {
+      num_3d += static_cast<std::size_t>(proj_data_info.get_num_axial_poss(segment_num))
+                * static_cast<std::size_t>(proj_data_info.get_num_views())
+                * static_cast<std::size_t>(proj_data_info.get_num_tangential_poss());
+    }
+  return num_3d * static_cast<std::size_t>(proj_data_info.get_num_tof_poss());
+}
+
+inline shared_ptr<ProjDataInMemory>
+make_cuda_managed_proj_data_in_memory_sptr(
+    const shared_ptr<const ExamInfo>& exam_info_sptr,
+    const shared_ptr<const ProjDataInfo>& proj_data_info_sptr)
+{
+  const std::size_t num_elems = proj_data_num_elems(*proj_data_info_sptr);
+  Array<1, float> buffer(
+      IndexRange<1>(0, static_cast<int>(num_elems) - 1),
+      make_cuda_managed_shared_array<float>(num_elems));
+  std::fill(buffer.begin_all(), buffer.end_all(), 0.F);
+  return shared_ptr<ProjDataInMemory>(
+      new ProjDataInMemory(exam_info_sptr, proj_data_info_sptr, std::move(buffer)));
 }
 
 template <typename elemT>
